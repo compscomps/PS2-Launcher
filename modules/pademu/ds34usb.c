@@ -10,6 +10,7 @@
 #include "ds34usb.h"
 #include "sys_utils.h"
 #include "padmacro.h"
+#include "hidpad.h"
 
 // #define DPRINTF(x...) printf(x)
 #define DPRINTF(x...)
@@ -19,6 +20,9 @@
 
 #define MAX_PADS 4
 #define XBOX_VENDOR_MICROSOFT 0x045E
+#define PS2ADAPTER_VID        0x0810 // generic PS2-to-USB adapters and game stick pads
+#define PS2ADAPTER_PID        0x0001
+#define USB_CLASS_HID_PAD     0x03
 #define XBOXUSB_INPUT_PACKET  0x20
 
 static u8 output_01_report[] =
@@ -67,6 +71,8 @@ static int xbox_poll_sema = -1;
 static int xbox_poll_result = 1;
 static int xbox_poll_tid = -1;
 static int xbox_poll_pending = 0;
+static hidpad_map hid_map[MAX_PADS];
+static u8 hid_desc_buf[HIDPAD_MAX_DESC + 32] __attribute((aligned(4))) = {0};
 static short xbox_axis_center[MAX_PADS][4] = {{0}};
 static u8 xbox_axis_center_valid[MAX_PADS] = {0};
 
@@ -96,6 +102,18 @@ static int xboxusb_send_init(int pad);
 
 ds34usb_device ds34pad[MAX_PADS];
 
+// A plain HID gamepad (not one of the pads this module already knows): the PS2 adapters, game stick pads and the like.
+// Whether it really is a gamepad is known only when its report descriptor has been read.
+static int is_generic_hid(const UsbDeviceDescriptor *device, const UsbInterfaceDescriptor *interface)
+{
+    if (device->idVendor == PS2ADAPTER_VID && device->idProduct == PS2ADAPTER_PID)
+        return 1;
+    if (device->idVendor == DS34_VID || device->idVendor == SONY_VID || device->idVendor == XBOX_VENDOR_MICROSOFT)
+        return 0;
+    return interface != NULL && interface->bInterfaceClass == USB_CLASS_HID_PAD && interface->bInterfaceSubClass == 0 &&
+           interface->bInterfaceProtocol == 0 && interface->bNumEndpoints >= 1;
+}
+
 int usb_probe(int devId)
 {
     UsbDeviceDescriptor *device = NULL;
@@ -117,6 +135,14 @@ int usb_probe(int devId)
 
     if (device->idVendor == XBOX_VENDOR_MICROSOFT)
         return 1;
+
+    {
+        UsbConfigDescriptor *config = (UsbConfigDescriptor *)UsbGetDeviceStaticDescriptor(devId, device, USB_DT_CONFIG);
+        UsbInterfaceDescriptor *interface = config != NULL ? (UsbInterfaceDescriptor *)((char *)config + config->bLength) : NULL;
+
+        if (is_generic_hid(device, interface))
+            return 1;
+    }
 
     return 0;
 }
@@ -165,6 +191,18 @@ int usb_connect(int devId)
         ds34pad[pad].analog_btn = 1;
         xbox_axis_center_valid[pad] = 0;
         epCount = interface->bNumEndpoints;
+    } else if (is_generic_hid(device, interface) && device->idProduct != DS3_PID && device->idProduct != DS4_PID && device->idProduct != DS4_PID_SLIM) {
+        const u8 *hid = (const u8 *)interface + interface->bLength; // the HID descriptor follows the interface's
+
+        ds34pad[pad].type = GENERIC_HID;
+        ds34pad[pad].analog_btn = 1;
+        ds34pad[pad].hid_ifnum = interface->bInterfaceNumber;
+        ds34pad[pad].hid_desc_len = (hid[1] == 0x21) ? (u16)(hid[7] | (hid[8] << 8)) : 0;
+        if (ds34pad[pad].hid_desc_len > HIDPAD_MAX_DESC)
+            ds34pad[pad].hid_desc_len = HIDPAD_MAX_DESC;
+        ds34pad[pad].hid_layout = (device->idVendor == PS2ADAPTER_VID && device->idProduct == PS2ADAPTER_PID) ? HIDPAD_LAYOUT_PS2 : HIDPAD_LAYOUT_GENERIC;
+        hid_map[pad].valid = 0;
+        epCount = interface->bNumEndpoints - 1;
     } else if (device->idProduct == DS3_PID) {
         ds34pad[pad].type = DS3;
         epCount = interface->bNumEndpoints - 1;
@@ -185,6 +223,7 @@ int usb_connect(int devId)
         if (endpoint->bmAttributes == USB_ENDPOINT_XFER_INT) {
             if ((endpoint->bEndpointAddress & USB_ENDPOINT_DIR_MASK) == USB_DIR_IN && ds34pad[pad].interruptEndp < 0) {
                 ds34pad[pad].interruptEndp = UsbOpenEndpointAligned(devId, endpoint);
+                ds34pad[pad].hid_pkt = (u16)endpoint->wMaxPacketSizeHB << 8 | endpoint->wMaxPacketSizeLB;
                 DPRINTF("DS34USB: register Event endpoint id =%i addr=%02X packetSize=%i\n", ds34pad[pad].interruptEndp, endpoint->bEndpointAddress, (unsigned short int)endpoint->wMaxPacketSizeHB << 8 | endpoint->wMaxPacketSizeLB);
             }
             if ((endpoint->bEndpointAddress & USB_ENDPOINT_DIR_MASK) == USB_DIR_OUT && ds34pad[pad].outEndp < 0) {
@@ -197,7 +236,7 @@ int usb_connect(int devId)
 
     } while (epCount--);
 
-    if (ds34pad[pad].interruptEndp < 0 || ds34pad[pad].outEndp < 0) {
+    if (ds34pad[pad].interruptEndp < 0 || (ds34pad[pad].outEndp < 0 && ds34pad[pad].type != GENERIC_HID)) {
         usb_release(pad);
         return 1;
     }
@@ -245,6 +284,8 @@ static void usb_release(int pad)
     ds34pad[pad].pid = 0;
     ds34pad[pad].xbox_seq = 0;
     ds34pad[pad].status = DS34USB_STATE_DISCONNECTED;
+    ds34pad[pad].hid_pkt = 0;
+    hid_map[pad].valid = 0;
     xbox_axis_center_valid[pad] = 0;
 
     SignalSema(ds34pad[pad].sema);
@@ -272,6 +313,18 @@ static void usb_cmd_cb(int resultCode, int bytes, void *arg)
     SignalSema(ds34pad[pad].cmd_sema);
 }
 
+static void hid_desc_cb(int resultCode, int bytes, void *arg)
+{
+    int pad = (int)arg;
+
+    WaitSema(ds34pad[pad].sema);
+    if (resultCode == USB_RC_OK && ds34pad[pad].devId >= 0 && hidpad_parse(hid_desc_buf, bytes, &hid_map[pad])) {
+        DPRINTF("DS34USB: generic pad: %d buttons\n", hid_map[pad].nbuttons);
+        ds34pad[pad].status |= DS34USB_STATE_RUNNING;
+    }
+    SignalSema(ds34pad[pad].sema);
+}
+
 static void usb_config_set(int result, int count, void *arg)
 {
     int pad = (int)arg;
@@ -285,6 +338,15 @@ static void usb_config_set(int result, int count, void *arg)
     }
 
     ds34pad[pad].status |= DS34USB_STATE_CONFIGURED;
+
+    if (ds34pad[pad].type == GENERIC_HID) {
+        // ask the pad for its report descriptor; it is running when that has been read (hid_desc_cb), not before
+        if (ds34pad[pad].hid_desc_len == 0 ||
+            UsbControlTransfer(ds34pad[pad].controlEndp, 0x81, 0x06, 0x2200, ds34pad[pad].hid_ifnum, ds34pad[pad].hid_desc_len, hid_desc_buf, hid_desc_cb, (void *)pad) != USB_RC_OK)
+            DPRINTF("DS34USB: generic pad: no report descriptor\n");
+        SignalSema(ds34pad[pad].sema);
+        return;
+    }
 
     if (ds34pad[pad].type == DS3) {
         DS3USB_init(pad);
@@ -322,6 +384,8 @@ static void DS3USB_init(int pad)
 static void readReport(u8 *data, int pad_idx)
 {
     ds34usb_device *pad = &ds34pad[pad_idx];
+    if (pad->type == GENERIC_HID)
+        return;
     if (pad->type == GUITAR_GH || pad->type == GUITAR_RB) {
         struct ds3guitarreport *report;
 
@@ -436,7 +500,10 @@ static void xboxusb_poll_cb(int resultCode, int bytes, void *arg)
 
     xbox_poll_result = resultCode;
     WaitSema(ds34pad[pad].sema);
-    if (xbox_poll_result == USB_RC_OK && xboxusb_is_input_packet(xbox_poll_buf)) {
+    if (xbox_poll_result == USB_RC_OK && ds34pad[pad].type == GENERIC_HID) {
+        if (bytes > 0 && hidpad_translate(&hid_map[pad], xbox_poll_buf, bytes, ds34pad[pad].hid_layout, &ds34pad[pad].ds2))
+            padMacroPerform(&ds34pad[pad].ds2, 0);
+    } else if (xbox_poll_result == USB_RC_OK && xboxusb_is_input_packet(xbox_poll_buf)) {
         if (!xbox_axis_center_valid[pad])
             xboxusb_update_axis_center(pad, xbox_poll_buf);
         xboxusb_translate_input(pad, xbox_poll_buf, &ds34pad[pad].ds2);
@@ -511,11 +578,19 @@ static void xboxusb_poll_thread(void *arg)
     while (1) {
         if (!xbox_poll_pending) {
             for (pad = 0; pad < MAX_PADS; pad++) {
-                if (ds34pad[pad].type != XBOX_USB || !(ds34pad[pad].status & DS34USB_STATE_CONFIGURED) || ds34pad[pad].interruptEndp < 0)
+                int size = MAX_BUFFER_SIZE;
+
+                if ((ds34pad[pad].type != XBOX_USB && ds34pad[pad].type != GENERIC_HID) || !(ds34pad[pad].status & DS34USB_STATE_CONFIGURED) || ds34pad[pad].interruptEndp < 0)
                     continue;
+                if (ds34pad[pad].type == GENERIC_HID) {
+                    if (!(ds34pad[pad].status & DS34USB_STATE_RUNNING))
+                        continue; // its descriptor has not been read yet
+                    if (ds34pad[pad].hid_pkt > 0 && ds34pad[pad].hid_pkt <= MAX_BUFFER_SIZE)
+                        size = ds34pad[pad].hid_pkt; // one report at a time, not a transfer of several
+                }
 
                 xbox_poll_pending = 1;
-                ret = UsbInterruptTransfer(ds34pad[pad].interruptEndp, xbox_poll_buf, MAX_BUFFER_SIZE, xboxusb_poll_cb, (void *)pad);
+                ret = UsbInterruptTransfer(ds34pad[pad].interruptEndp, xbox_poll_buf, size, xboxusb_poll_cb, (void *)pad);
                 if (ret != USB_RC_OK)
                     xbox_poll_pending = 0;
                 break;
@@ -701,7 +776,7 @@ int ds34usb_get_data(u8 *dst, int size, int port)
 
     WaitSema(ds34pad[port].sema);
 
-    if (ds34pad[port].type == XBOX_USB) {
+    if (ds34pad[port].type == XBOX_USB || ds34pad[port].type == GENERIC_HID) {
         mips_memcpy(dst, ds34pad[port].data, size);
         ret = ds34pad[port].analog_btn & 1;
         SignalSema(ds34pad[port].sema);

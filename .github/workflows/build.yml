@@ -1,0 +1,32 @@
+name: Build PS2 Launcher
+
+# Run it by hand: Actions, "Build PS2 Launcher", Run workflow. The finished ELF is in the run's Artifacts.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ps2dev/ps2dev:latest
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache build-base git zip gawk python3 p7zip bash
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Let git work in the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build
+        run: make all
+
+      - name: Keep the ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS2-Launcher-ELF
+          path: |
+            PS2L.ELF
+            opl.elf
+          if-no-files-found: error

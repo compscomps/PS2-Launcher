@@ -10,6 +10,7 @@
 #define GUITAR_GH 2
 #define GUITAR_RB 3
 #define XBOX_USB  4
+#define GENERIC_HID 5 // any plain HID gamepad: its own report descriptor says where the buttons are
 
 #define MODEL_GUITAR 1
 #define MODEL_PS2    3
@@ -41,6 +42,10 @@ typedef struct _usb_ds34
     };
     u8 analog_btn;
     u8 btn_delay;
+    u8 hid_ifnum;      // generic HID: the interface it was found on
+    u8 hid_layout;     // generic HID: HIDPAD_LAYOUT_*
+    u16 hid_desc_len;  // generic HID: length of its report descriptor
+    u16 hid_pkt;       // generic HID: size of one report on the interrupt endpoint
 } ds34usb_device;
 
 enum eDS34USBStatus {

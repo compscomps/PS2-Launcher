@@ -4,7 +4,7 @@ ifeq ($(USE_USB),1)
 IOP_BIN = usb_pademu.irx
 IOP_CFLAGS += -DUSB
 IOP_OBJS_DIR = obj.usb/
-IOP_OBJS += ds34usb.o
+IOP_OBJS += ds34usb.o hidpad.o
 endif
 
 ifeq ($(USE_BT),1)
