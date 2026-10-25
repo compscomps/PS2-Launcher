@@ -10,7 +10,7 @@ jobs:
     container: ps2dev/ps2dev:latest
     steps:
       - name: Install dependencies
-        run: apk add --no-cache build-base git zip gawk python3 p7zip bash
+        run: apk add --no-cache build-base git zip gawk python3 py3-yaml p7zip bash
 
       - uses: actions/checkout@v4
         with:
@@ -18,6 +18,20 @@ jobs:
 
       - name: Let git work in the container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # lwNBD (the network drive server) is not kept in the repository. It is fetched and built here; if that does
+      # not work, a stand-in module is used so the rest still builds (only the NBD server is then left out).
+      - name: lwNBD
+        run: |
+          if git clone --depth 1 https://github.com/bignaux/lwNBD modules/network/lwNBD && make -C modules/network/lwNBD TARGET=iop; then
+            echo "lwNBD built"
+          else
+            echo "::warning::lwNBD could not be built, the NBD server is left out of this build"
+            rm -rf modules/network/lwNBD
+            mkdir -p modules/network/lwNBD
+            printf 'NBD\n' > modules/network/lwNBD/lwnbdsvr.irx
+            printf 'all:\n\t@true\nclean:\n\t@true\n' > modules/network/lwNBD/Makefile
+          fi
 
       - name: Build
         run: make all

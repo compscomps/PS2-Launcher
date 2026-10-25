@@ -226,6 +226,7 @@ ifdef PS2SDK
 
 all:
 	echo "Building Open PS2 Loader $(OPL_VERSION)..."
+	$(MAKE) $(INTERNAL_LANGUAGE_H) $(INTERNAL_LANGUAGE_C)
 	echo "-Interface"
 ifneq ($(NOT_PACKED),1)
 	$(MAKE) $(EE_BIN_PACKED)
@@ -832,11 +833,12 @@ $(ENGLISH_TEMPLATE_YML): $(BASE_LANGUAGE) $(LANG_COMPILER)
 $(ENGLISH_LNG): $(ENGLISH_TEMPLATE_YML) $(BASE_LANGUAGE) $(LANG_COMPILER)
 	python3 $(LANG_COMPILER) --make_lng --base $(BASE_LANGUAGE) --translation $< $@
 
-$(INTERNAL_LANGUAGE_C):
-	@echo "Using static internal english translation source: $@"
+# The built-in English texts are generated from the base language file (they are not kept in the repository)
+$(INTERNAL_LANGUAGE_H): $(BASE_LANGUAGE) lang_internal_gen.py
+	python3 lang_internal_gen.py $(BASE_LANGUAGE) $(INTERNAL_LANGUAGE_H) $(INTERNAL_LANGUAGE_C)
 
-$(INTERNAL_LANGUAGE_H):
-	@echo "Using static internal english translation header: $@"
+$(INTERNAL_LANGUAGE_C): $(INTERNAL_LANGUAGE_H)
+	@true
 
 ifndef PS2SDK
 ps2sdk-not-setup:
