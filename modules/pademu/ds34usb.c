@@ -323,7 +323,7 @@ static void hid_desc_cb(int resultCode, int bytes, void *arg)
     WaitSema(ds34pad[pad].sema);
     if (resultCode == USB_RC_OK && ds34pad[pad].devId >= 0 && hidpad_parse(hid_desc_buf, bytes, &hid_new_map)) {
         DPRINTF("DS34USB: generic pad: %d buttons\n", hid_new_map.nbuttons);
-        hid_map[pad] = hid_new_map; // the pad's own description replaces the one it started with
+        mips_memcpy(&hid_map[pad], &hid_new_map, sizeof(hidpad_map)); // the pad's own description replaces the one it started with
         ds34pad[pad].status |= DS34USB_STATE_RUNNING;
     }
     SignalSema(ds34pad[pad].sema);
