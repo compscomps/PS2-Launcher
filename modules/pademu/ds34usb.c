@@ -72,6 +72,7 @@ static int xbox_poll_result = 1;
 static int xbox_poll_tid = -1;
 static int xbox_poll_pending = 0;
 static hidpad_map hid_map[MAX_PADS];
+static hidpad_map hid_new_map; // the map read from the pad, until it is known to be good
 static u8 hid_desc_buf[HIDPAD_MAX_DESC + 32] __attribute((aligned(4))) = {0};
 static short xbox_axis_center[MAX_PADS][4] = {{0}};
 static u8 xbox_axis_center_valid[MAX_PADS] = {0};
@@ -198,6 +199,8 @@ int usb_connect(int devId)
         ds34pad[pad].analog_btn = 1;
         ds34pad[pad].hid_ifnum = interface->bInterfaceNumber;
         ds34pad[pad].hid_desc_len = (hid[1] == 0x21) ? (u16)(hid[7] | (hid[8] << 8)) : 0;
+        if (ds34pad[pad].hid_desc_len == 0)
+            ds34pad[pad].hid_desc_len = 128; // not where it should be: ask for up to 128 bytes, the pad answers with what it has
         if (ds34pad[pad].hid_desc_len > HIDPAD_MAX_DESC)
             ds34pad[pad].hid_desc_len = HIDPAD_MAX_DESC;
         ds34pad[pad].hid_layout = (device->idVendor == PS2ADAPTER_VID && device->idProduct == PS2ADAPTER_PID) ? HIDPAD_LAYOUT_PS2 : HIDPAD_LAYOUT_GENERIC;
@@ -318,12 +321,14 @@ static void hid_desc_cb(int resultCode, int bytes, void *arg)
     int pad = (int)arg;
 
     WaitSema(ds34pad[pad].sema);
-    if (resultCode == USB_RC_OK && ds34pad[pad].devId >= 0 && hidpad_parse(hid_desc_buf, bytes, &hid_map[pad])) {
-        DPRINTF("DS34USB: generic pad: %d buttons\n", hid_map[pad].nbuttons);
+    if (resultCode == USB_RC_OK && ds34pad[pad].devId >= 0 && hidpad_parse(hid_desc_buf, bytes, &hid_new_map)) {
+        DPRINTF("DS34USB: generic pad: %d buttons\n", hid_new_map.nbuttons);
+        hid_map[pad] = hid_new_map; // the pad's own description replaces the one it started with
         ds34pad[pad].status |= DS34USB_STATE_RUNNING;
     }
     SignalSema(ds34pad[pad].sema);
 }
+
 
 static void usb_config_set(int result, int count, void *arg)
 {
@@ -340,9 +345,12 @@ static void usb_config_set(int result, int count, void *arg)
     ds34pad[pad].status |= DS34USB_STATE_CONFIGURED;
 
     if (ds34pad[pad].type == GENERIC_HID) {
-        // ask the pad for its report descriptor; it is running when that has been read (hid_desc_cb), not before
-        if (ds34pad[pad].hid_desc_len == 0 ||
-            UsbControlTransfer(ds34pad[pad].controlEndp, 0x81, 0x06, 0x2200, ds34pad[pad].hid_ifnum, ds34pad[pad].hid_desc_len, hid_desc_buf, hid_desc_cb, (void *)pad) != USB_RC_OK)
+        // The known PS2-adapter receivers start at once with the layout they are known to have, so that the pad is read
+        // (and its receiver linked) whatever else happens; any other pad starts when its descriptor has been read.
+        if (ds34pad[pad].hid_layout == HIDPAD_LAYOUT_PS2 && hidpad_builtin_ps2adapter(&hid_map[pad]))
+            ds34pad[pad].status |= DS34USB_STATE_RUNNING;
+        // and its own descriptor, which replaces that one when it can be read
+        if (UsbControlTransfer(ds34pad[pad].controlEndp, 0x81, 0x06, 0x2200, ds34pad[pad].hid_ifnum, ds34pad[pad].hid_desc_len, hid_desc_buf, hid_desc_cb, (void *)pad) != USB_RC_OK)
             DPRINTF("DS34USB: generic pad: no report descriptor\n");
         SignalSema(ds34pad[pad].sema);
         return;
@@ -585,8 +593,10 @@ static void xboxusb_poll_thread(void *arg)
                 if (ds34pad[pad].type == GENERIC_HID) {
                     if (!(ds34pad[pad].status & DS34USB_STATE_RUNNING))
                         continue; // its descriptor has not been read yet
-                    if (ds34pad[pad].hid_pkt > 0 && ds34pad[pad].hid_pkt <= MAX_BUFFER_SIZE)
-                        size = ds34pad[pad].hid_pkt; // one report at a time, not a transfer of several
+                    if (hidpad_report_bytes(&hid_map[pad]) > 0 && hidpad_report_bytes(&hid_map[pad]) <= MAX_BUFFER_SIZE)
+                        size = hidpad_report_bytes(&hid_map[pad]); // one whole report at a time, not a transfer of several
+                    else if (ds34pad[pad].hid_pkt > 0 && ds34pad[pad].hid_pkt <= MAX_BUFFER_SIZE)
+                        size = ds34pad[pad].hid_pkt;
                 }
 
                 xbox_poll_pending = 1;

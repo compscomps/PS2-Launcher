@@ -30,12 +30,19 @@ typedef struct
     uint8_t valid;     /* it describes a gamepad: at least 4 buttons and 2 axes */
     uint8_t report_id; /* 0 = the reports have no ID byte */
     uint8_t nbuttons;
+    uint16_t report_bits; /* size of the report, without its ID byte */
     hidpad_field button[HIDPAD_MAX_BUTTONS];
     hidpad_field x, y, z, rx, ry, rz, hat;
 } hidpad_map;
 
 /* returns 1 when the descriptor describes a gamepad (map->valid) */
 int hidpad_parse(const uint8_t *desc, int len, hidpad_map *map);
+
+/* the descriptor of the generic PS2-to-USB adapters / game stick receivers (0810:0001), for when the pad's own cannot be read */
+int hidpad_builtin_ps2adapter(hidpad_map *map);
+
+/* bytes in one report as the pad sends it (with the ID byte, if it has one); 0 = not known */
+int hidpad_report_bytes(const hidpad_map *map);
 
 /* report: what the pad sent, with its ID byte if it has one. Returns 0 when it is not a report of this pad. */
 int hidpad_translate(const hidpad_map *map, const uint8_t *report, int len, int layout, struct ds2report *out);
